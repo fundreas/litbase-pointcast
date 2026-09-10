@@ -1,0 +1,18 @@
+# Credentials -- never committed; CI reads KICK_EMAIL / KICK_PASS from secrets.
+.env
+
+# Working cache. Rebuilt from the API on every run; the committed history
+# lives in data/snapshots/ instead (see src/kickbase_xp/archive.py).
+data/history.sqlite
+data/history.sqlite-wal
+data/history.sqlite-shm
+
+# Published output. Deployed to Pages as an artifact, not committed.
+site/
+
+__pycache__/
+*.pyc
+.venv/
+.pytest_cache/
+*.csv
+!data/snapshots/*.csv

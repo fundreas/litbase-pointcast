@@ -1,0 +1,35 @@
+[project]
+name = "kickbase-xp"
+version = "0.1.0"
+description = "Expected Kickbase points (xP) — nightly Bundesliga points forecast published as a static JSON API"
+readme = "README.md"
+requires-python = ">=3.12"
+authors = [
+    { name = "Andreas Fend", email = "andreas.fend@quantics.io" }
+]
+dependencies = [
+    "requests>=2.32",
+    "pandas>=2.2",
+    "numpy>=1.26",
+    "lightgbm>=4.5",
+    "scikit-learn>=1.5",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=8.0",
+]
+
+[project.scripts]
+kickbase-xp = "kickbase_xp.cli:main"
+
+[build-system]
+requires = ["uv_build>=0.12.2,<0.13.0"]
+build-backend = "uv_build"
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+addopts = "-q"
+
+[tool.ruff]
+line-length = 100

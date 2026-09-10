@@ -1,0 +1,94 @@
+name: nightly
+
+# Kickbase updates market values around 22:00 CET. Run after that so the MV
+# momentum feature sees the fresh numbers. Cron is UTC, and GitHub queues
+# scheduled jobs on the hour, so 22:20 UTC keeps a margin either side of the
+# CET/CEST shift.
+on:
+  schedule:
+    - cron: "20 22 * * *"
+  workflow_dispatch:
+    inputs:
+      matchday:
+        description: "Target matchday (blank = the next one)"
+        required: false
+        type: string
+      skip_fetch:
+        description: "Reuse the committed history instead of calling the API"
+        required: false
+        type: boolean
+        default: false
+
+concurrency:
+  group: nightly
+  cancel-in-progress: false
+
+permissions:
+  contents: write   # commit the refreshed history file
+  pages: write
+  id-token: write
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: astral-sh/setup-uv@v5
+        with:
+          enable-cache: true
+
+      - name: Install
+        run: uv sync --frozen --extra dev
+
+      - name: Test
+        run: uv run pytest
+
+      - name: Fetch Kickbase data
+        if: ${{ !inputs.skip_fetch }}
+        env:
+          KICK_EMAIL: ${{ secrets.KICK_EMAIL }}
+          KICK_PASS: ${{ secrets.KICK_PASS }}
+        run: uv run kickbase-xp fetch --delay 0.3
+
+      - name: Train and publish
+        run: |
+          uv run kickbase-xp publish --out site \
+            ${{ inputs.matchday && format('--matchday {0}', inputs.matchday) || '' }}
+
+      - name: Commit today's snapshot
+        # Only the perishable slice is committed: what each player's status
+        # and market value were *today*. The API cannot re-serve that, while
+        # everything else (performances, fixtures, squads) it replays in full
+        # on every call. One ~10 KB file per day, written once and never
+        # rewritten -- see src/kickbase_xp/archive.py.
+        if: ${{ !inputs.skip_fetch }}
+        run: |
+          if [ -z "$(git status --porcelain data/snapshots)" ]; then
+            echo "snapshot unchanged"
+            exit 0
+          fi
+          git config user.name  "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add data/snapshots
+          git commit -m "chore: snapshot $(date -u +%Y-%m-%d)"
+          # A concurrent run or a push to main while we were training would
+          # make this fail; rebase and retry rather than dropping the day.
+          git pull --rebase --autostash origin main
+          git push
+
+      - uses: actions/configure-pages@v5
+      - uses: actions/upload-pages-artifact@v3
+        with:
+          path: site
+
+  deploy:
+    needs: build
+    runs-on: ubuntu-latest
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
+    steps:
+      - id: deployment
+        uses: actions/deploy-pages@v4
