@@ -28,10 +28,13 @@ from __future__ import annotations
 
 import csv
 import gzip
+import io
 import logging
 import sqlite3
+from collections.abc import Iterable, Mapping
 from datetime import date, datetime, timezone
 from pathlib import Path
+from typing import Any
 
 from . import db
 
@@ -54,6 +57,33 @@ def day_number(day: date) -> int:
     return (day - EPOCH).days
 
 
+def compress(payload: str) -> bytes:
+    """Gzip deterministically: same text in, same bytes out, always.
+
+    `gzip` stamps the current time into its header by default, so rewriting
+    an unchanged snapshot still produces a different file. That would defeat
+    the nightly job's "commit only if something changed" guard and add a
+    pointless 4 KB blob to the repository on every single run. `mtime=0`
+    pins the header; the archive is keyed by date anyway, so the embedded
+    timestamp carried no information to begin with.
+    """
+    raw = payload.encode("utf-8")
+    buffer = io.BytesIO()
+    with gzip.GzipFile(fileobj=buffer, mode="wb", compresslevel=9, mtime=0) as gz:
+        gz.write(raw)
+    return buffer.getvalue()
+
+
+def render_snapshot(rows: Iterable[Mapping[str, Any] | sqlite3.Row]) -> str:
+    """The CSV body of a snapshot, as text."""
+    out = io.StringIO(newline="")
+    writer = csv.writer(out)
+    writer.writerow(FIELDS)
+    for row in rows:
+        writer.writerow([row[f] if row[f] is not None else "" for f in FIELDS])
+    return out.getvalue()
+
+
 def write_snapshot(conn: sqlite3.Connection, root: Path | str, day: date | None = None) -> Path:
     """Freeze one day's status and market value for every known player."""
     day = day or datetime.now(timezone.utc).date()
@@ -64,11 +94,7 @@ def write_snapshot(conn: sqlite3.Connection, root: Path | str, day: date | None 
     ).fetchall()
     path = snapshot_path(root, day)
     path.parent.mkdir(parents=True, exist_ok=True)
-    with gzip.open(path, "wt", newline="", encoding="utf-8") as fh:
-        writer = csv.writer(fh)
-        writer.writerow(FIELDS)
-        for row in rows:
-            writer.writerow([row[f] if row[f] is not None else "" for f in FIELDS])
+    path.write_bytes(compress(render_snapshot(rows)))
     log.info("snapshot %s: %d players -> %s", day, len(rows), path)
     return path
 

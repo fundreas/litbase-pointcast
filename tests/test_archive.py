@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import gzip
+import time
 from datetime import date
 
 import pandas as pd
@@ -108,6 +109,32 @@ def test_unrecognised_files_are_skipped(tmp_path):
     conn = db.connect(tmp_path / "a.sqlite")
     assert archive.load_snapshots(conn, snaps) == 0
     conn.close()
+
+
+def test_writing_the_same_day_twice_is_byte_identical(tmp_path):
+    """gzip stamps the clock into its header unless told not to.
+
+    If it does, the nightly job's "commit only if changed" guard never
+    fires and every run adds a fresh blob to the repository.
+    """
+    source = db.connect(tmp_path / "a.sqlite")
+    _seed(source)
+    first = archive.write_snapshot(source, tmp_path / "snapshots", DAY).read_bytes()
+    time.sleep(1.1)  # a different wall clock, which must not leak into the file
+    second = archive.write_snapshot(source, tmp_path / "snapshots", DAY).read_bytes()
+    source.close()
+    assert first == second
+
+
+def test_changed_content_still_changes_the_file(tmp_path):
+    source = db.connect(tmp_path / "a.sqlite")
+    _seed(source)
+    before = archive.write_snapshot(source, tmp_path / "snapshots", DAY).read_bytes()
+    db.upsert_status_snapshots(source, [(DAY.isoformat(), "p1", 1, 4_000_000, 2, "1")])
+    source.commit()
+    after = archive.write_snapshot(source, tmp_path / "snapshots", DAY).read_bytes()
+    source.close()
+    assert before != after
 
 
 def test_snapshot_file_is_small_and_readable(tmp_path):

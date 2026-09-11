@@ -8,10 +8,12 @@ from __future__ import annotations
 
 import sqlite3
 from datetime import datetime, timedelta, timezone
+from pathlib import Path
 
 import pytest
 
 from kickbase_xp import db
+from kickbase_xp.config import DEFAULT_SNAPSHOT_DIR
 
 COMPETITION = "Bundesliga"
 SEASON = "42"
@@ -107,6 +109,25 @@ def _mv_rows() -> list[tuple]:
         for d in range(-60, 90):
             rows.append((pid, base_day + d, 1_000_000.0 * pos * (1 + d / 500.0)))
     return rows
+
+
+@pytest.fixture(autouse=True)
+def _guard_the_real_archive():
+    """Fail any test that writes into the repository's committed archive.
+
+    `data/snapshots/` is real, committed data. Several entry points default
+    to it, so a test that forgets to pass `snapshot_dir=tmp_path/...` will
+    silently write fake players into it -- which is exactly how `p1` and
+    `p2` once ended up in a released snapshot.
+    """
+    real = Path(DEFAULT_SNAPSHOT_DIR)
+    before = {p: p.stat().st_mtime_ns for p in real.glob("*")} if real.exists() else {}
+    yield
+    after = {p: p.stat().st_mtime_ns for p in real.glob("*")} if real.exists() else {}
+    assert after == before, (
+        f"test touched the committed archive at {real}; "
+        "pass an explicit snapshot_dir under tmp_path"
+    )
 
 
 @pytest.fixture
