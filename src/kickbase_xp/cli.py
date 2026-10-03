@@ -12,6 +12,7 @@ from __future__ import annotations
 
 import argparse
 import logging
+import os
 import sys
 from pathlib import Path
 
@@ -117,7 +118,11 @@ def cmd_publish(args: argparse.Namespace) -> int:
     finally:
         conn.close()
     result = publish(
-        run, Path(args.out), feature_rows=run.feature_rows, rankings=season_rankings
+        run,
+        Path(args.out),
+        feature_rows=run.feature_rows,
+        rankings=season_rankings,
+        base_url=args.base_url,
     )
     print(
         f"matchday {result['matchday']}: {result['files']} files -> {result['out_dir']} "
@@ -218,12 +223,16 @@ def build_parser() -> argparse.ArgumentParser:
     sp = sub.add_parser("publish", help="train and write the static JSON API")
     add_model_args(sp)
     sp.add_argument("--out", default=str(DEFAULT_OUT_DIR))
+    sp.add_argument("--base-url", default=os.environ.get("KICKBASE_XP_BASE_URL"),
+                    help="deployed site root, advertised as the OpenAPI server")
     sp.set_defaults(func=cmd_publish)
 
     sp = sub.add_parser("run", help="fetch + train + publish (the nightly job)")
     add_api_args(sp)
     add_model_args(sp)
     sp.add_argument("--out", default=str(DEFAULT_OUT_DIR))
+    sp.add_argument("--base-url", default=os.environ.get("KICKBASE_XP_BASE_URL"),
+                    help="deployed site root, advertised as the OpenAPI server")
     sp.set_defaults(func=cmd_run)
 
     sp = sub.add_parser("validate", help="walk-forward MAE against the baselines")

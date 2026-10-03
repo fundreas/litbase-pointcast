@@ -18,6 +18,7 @@ from typing import Any
 import pandas as pd
 
 from .config import POSITIONS
+from .openapi import SPEC_MEDIA_TYPE, build_spec
 from .rankings import TOP_N, MatchdayStatus, SeasonRankings, ranked
 from .train import PredictionRun
 
@@ -202,6 +203,7 @@ def publish(
     *,
     feature_rows: pd.DataFrame | None = None,
     rankings: SeasonRankings | None = None,
+    base_url: str | None = None,
     clean: bool = True,
 ) -> dict[str, Any]:
     out_dir = Path(out_dir)
@@ -270,6 +272,8 @@ def publish(
     if rankings is not None:
         publish_rankings(rankings, version_dir, generated_at)
 
+    _write(version_dir / "openapi.json", build_spec(API_VERSION, base_url=base_url))
+
     index_payload = {
         "apiVersion": API_VERSION,
         "seasonId": str(run.season_id),
@@ -281,6 +285,7 @@ def publish(
         "topFeatures": run.metadata.get("top_features"),
         "recentValidation": run.metadata.get("selection"),
         "endpoints": {
+            "openapi": f"/{API_VERSION}/openapi.json",
             "index": f"/{API_VERSION}/index.json",
             "currentMatchday": f"/{API_VERSION}/matchday/current.json",
             "matchday": f"/{API_VERSION}/matchday/{{matchday}}.json",
@@ -317,6 +322,7 @@ def _landing_page(index_payload: dict[str, Any]) -> str:
 <html lang="en"><head><meta charset="utf-8">
 <meta name="viewport" content="width=device-width,initial-scale=1">
 <title>kickbase-xp — expected points API</title>
+<link rel="service-desc" href="{API_VERSION}/openapi.json" type="{SPEC_MEDIA_TYPE}">
 <style>
   :root {{ color-scheme: light dark; }}
   body {{ font: 15px/1.6 ui-sans-serif, system-ui, sans-serif; max-width: 46rem;
@@ -337,6 +343,8 @@ Currently matchday <strong>{md}</strong>, generated {generated}.</p>
 derived from the Kickbase v4 API alone — no betting odds, xG or external
 lineup predictors.</p>
 <h2>Endpoints</h2>
+<p>Machine-readable: <a href="{API_VERSION}/openapi.json"><code>/v1/openapi.json</code></a>
+(OpenAPI 3.1).</p>
 <table>
 <tr><th>Path</th><th>Contents</th></tr>
 <tr><td><code>/v1/index.json</code></td><td>matchday, model metadata, recent validation</td></tr>

@@ -17,6 +17,8 @@ dependencies = [
 
 [project.optional-dependencies]
 dev = [
+    "jsonschema>=4.26.0",
+    "openapi-spec-validator>=0.9.0",
     "pytest>=8.0",
 ]
 

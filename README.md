@@ -18,6 +18,7 @@ Versioned under `/v1/` from the first run, so a later schema change becomes
 
 | Path | Contents |
 |---|---|
+| `/v1/openapi.json` | OpenAPI 3.1 description of everything below |
 | `/v1/index.json` | matchday, model metadata, recent validation |
 | `/v1/matchday/current.json` | all players, sorted by xP |
 | `/v1/matchday/{md}.json` | one specific matchday |
@@ -39,6 +40,14 @@ Versioned under `/v1/` from the first run, so a later schema change becomes
   "generatedAt": "2026-09-10T21:04:00Z"
 }
 ```
+
+The OpenAPI document is generated from the same constants as the output, and
+the tests validate every published file against it, with unknown fields
+rejected, so the two cannot drift apart. The spec itself allows unknown fields,
+because v1 only ever grows by adding fields and a client validating against it
+should not break when that happens. Its first `servers` entry is the deployed
+Pages URL, which the nightly job takes from `actions/configure-pages`. The
+landing page links the spec as `rel="service-desc"` (RFC 8631).
 
 `p20`/`p80` are **unconditional** — they already fold in the chance of not
 playing at all, so a rotation risk shows up as a floor of `0` rather than as

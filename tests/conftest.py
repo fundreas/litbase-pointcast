@@ -132,7 +132,14 @@ def _guard_the_real_archive():
 
 @pytest.fixture
 def conn(tmp_path) -> sqlite3.Connection:
-    connection = db.connect(tmp_path / "test.sqlite")
+    connection = seeded_connection(tmp_path / "test.sqlite")
+    yield connection
+    connection.close()
+
+
+def seeded_connection(path: Path) -> sqlite3.Connection:
+    """The synthetic league, for fixtures with a wider scope than `conn`."""
+    connection = db.connect(path)
     now = NOW.isoformat()
     db.upsert_teams(connection, [(tid, name, now) for tid, name in TEAMS])
     db.upsert_players(
@@ -145,5 +152,4 @@ def conn(tmp_path) -> sqlite3.Connection:
     db.upsert_performances(connection, _perf_rows())
     db.upsert_market_values(connection, _mv_rows())
     connection.commit()
-    yield connection
-    connection.close()
+    return connection
