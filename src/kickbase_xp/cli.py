@@ -29,6 +29,7 @@ from .config import (
 )
 from .fetch import run_fetch
 from .publish import publish
+from .rankings import build_rankings
 from .train import run_training
 from .validate import walk_forward
 
@@ -110,7 +111,14 @@ def cmd_predict(args: argparse.Namespace) -> int:
 
 def cmd_publish(args: argparse.Namespace) -> int:
     run = _predict(args)
-    result = publish(run, Path(args.out), feature_rows=run.feature_rows)
+    conn = _connect(args)
+    try:
+        season_rankings = build_rankings(conn, run.season_id)
+    finally:
+        conn.close()
+    result = publish(
+        run, Path(args.out), feature_rows=run.feature_rows, rankings=season_rankings
+    )
     print(
         f"matchday {result['matchday']}: {result['files']} files -> {result['out_dir']} "
         f"(predictor: {run.metadata['predictor']})"

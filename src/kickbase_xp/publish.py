@@ -17,6 +17,8 @@ from typing import Any
 
 import pandas as pd
 
+from .config import POSITIONS
+from .rankings import TOP_N, MatchdayStatus, SeasonRankings, ranked
 from .train import PredictionRun
 
 log = logging.getLogger(__name__)
@@ -117,11 +119,89 @@ FEATURE_DIGEST = [
 ]
 
 
+def _ranking_entry(row: pd.Series, scope: str) -> dict[str, Any]:
+    entry = {
+        "rank": int(row["rank"]),
+        "playerId": str(row["player_id"]),
+        "name": _player_name(row),
+        "teamId": str(row["team_id"]) if row.get("team_id") else None,
+        "teamName": row.get("team_name"),
+        "position": row.get("position_label") if isinstance(row.get("position_label"), str) else None,
+        "points": _int(row["points"]),
+        "minutes": _int(row.get("minutes")),
+    }
+    if scope == "season":
+        appearances = int(row["appearances"])
+        entry["appearances"] = appearances
+        entry["pointsPerAppearance"] = _num(row["points"] / appearances) if appearances else None
+    return entry
+
+
+def _ranking_lists(table: pd.DataFrame, scope: str) -> dict[str, Any]:
+    def entries(position: str | None) -> list[dict[str, Any]]:
+        return [_ranking_entry(r, scope) for _, r in ranked(table, position=position).iterrows()]
+
+    return {
+        "overall": entries(None),
+        "byPosition": {label: entries(label) for label in POSITIONS.values()},
+    }
+
+
+def _status_fields(status: MatchdayStatus) -> dict[str, Any]:
+    return {
+        "matchday": status.matchday,
+        "complete": status.complete,
+        "matchesPlayed": status.matches_played,
+        "matchesTotal": status.matches_total,
+    }
+
+
+def publish_rankings(rankings: SeasonRankings, version_dir: Path, generated_at: str) -> None:
+    """`/v1/rankings/` -- actual points, per matchday and season to date."""
+    root = version_dir / "rankings"
+    latest = rankings.latest
+    for scope, tables in (("matchday", rankings.per_matchday), ("season", rankings.cumulative)):
+        for status in rankings.matchdays:
+            # For `season`, `matchday` is the last one summed: totals over 1..matchday.
+            payload = {
+                "apiVersion": API_VERSION,
+                "seasonId": rankings.season_id,
+                "scope": scope,
+                **_status_fields(status),
+                "top": TOP_N,
+                "generatedAt": generated_at,
+                **_ranking_lists(tables[status.matchday], scope),
+            }
+            _write(root / scope / f"{status.matchday}.json", payload)
+            if status is latest:
+                _write(root / scope / "current.json", payload)
+
+    _write(
+        root / "index.json",
+        {
+            "apiVersion": API_VERSION,
+            "seasonId": rankings.season_id,
+            "generatedAt": generated_at,
+            "top": TOP_N,
+            "positions": list(POSITIONS.values()),
+            "latestMatchday": latest.matchday if latest else None,
+            "matchdays": [_status_fields(s) for s in rankings.matchdays],
+            "endpoints": {
+                "matchday": f"/{API_VERSION}/rankings/matchday/{{matchday}}.json",
+                "currentMatchday": f"/{API_VERSION}/rankings/matchday/current.json",
+                "season": f"/{API_VERSION}/rankings/season/{{matchday}}.json",
+                "currentSeason": f"/{API_VERSION}/rankings/season/current.json",
+            },
+        },
+    )
+
+
 def publish(
     run: PredictionRun,
     out_dir: Path,
     *,
     feature_rows: pd.DataFrame | None = None,
+    rankings: SeasonRankings | None = None,
     clean: bool = True,
 ) -> dict[str, Any]:
     out_dir = Path(out_dir)
@@ -187,6 +267,9 @@ def publish(
         },
     )
 
+    if rankings is not None:
+        publish_rankings(rankings, version_dir, generated_at)
+
     index_payload = {
         "apiVersion": API_VERSION,
         "seasonId": str(run.season_id),
@@ -203,12 +286,19 @@ def publish(
             "matchday": f"/{API_VERSION}/matchday/{{matchday}}.json",
             "playerIndex": f"/{API_VERSION}/players/index.json",
             "player": f"/{API_VERSION}/players/{{playerId}}.json",
+            "rankings": f"/{API_VERSION}/rankings/index.json",
+            "matchdayRanking": f"/{API_VERSION}/rankings/matchday/{{matchday}}.json",
+            "seasonRanking": f"/{API_VERSION}/rankings/season/{{matchday}}.json",
         },
         "notes": {
             "pointsScale": "Kickbase points, roughly -100..600 per matchday.",
             "xP": "P(plays) x E[points | plays].",
             "p20/p80": "Unconditional floor/ceiling: includes the chance of not playing.",
             "source": "Kickbase v4 API only -- no odds, xG or external lineup feeds.",
+            "rankings": (
+                "Actual points of the running season, top 100 overall and per position. "
+                "`complete: false` marks a matchday still being played."
+            ),
         },
     }
     _write(version_dir / "index.json", index_payload)
@@ -254,6 +344,9 @@ lineup predictors.</p>
 <tr><td><code>/v1/matchday/{{md}}.json</code></td><td>a specific matchday</td></tr>
 <tr><td><code>/v1/players/index.json</code></td><td>compact player list</td></tr>
 <tr><td><code>/v1/players/{{playerId}}.json</code></td><td>one player incl. key features</td></tr>
+<tr><td><code>/v1/rankings/index.json</code></td><td>matchdays with actual-points rankings</td></tr>
+<tr><td><code>/v1/rankings/matchday/{{md}}.json</code></td><td>top 100 on one matchday, overall and per position</td></tr>
+<tr><td><code>/v1/rankings/season/{{md}}.json</code></td><td>top 100 season totals through matchday md</td></tr>
 </table>
 <h2>Reading the numbers</h2>
 <pre>xP   = P(plays) × E[points | plays]

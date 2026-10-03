@@ -48,6 +48,46 @@ a safe pick, which is what you actually want when setting a lineup.
 Kickbase points run roughly −100…600 per matchday. An xP of 140 is a good
 performance, not a typo.
 
+### Rankings
+
+Actual points of the running season, computed from the same performance
+history the model trains on, so they cost no extra API calls.
+
+| Path | Contents |
+|---|---|
+| `/v1/rankings/index.json` | ranked matchdays, each with `complete`, `matchesPlayed`, `matchesTotal` |
+| `/v1/rankings/matchday/{md}.json` | points scored on matchday `md` alone |
+| `/v1/rankings/season/{md}.json` | season totals over matchdays 1…`md` |
+| `/v1/rankings/{matchday,season}/current.json` | the latest matchday that has kicked off |
+
+Every file holds `overall` (top 100) and `byPosition` with `GK`, `DEF`,
+`MID` and `FWD` (top 100 each). Ties share a rank (`1, 1, 3`), and a tie at
+place 100 is kept whole, so a list can run a few entries long.
+
+```json
+{
+  "rank": 1,
+  "playerId": "1685",
+  "name": "Kimmich",
+  "teamId": "2",
+  "teamName": "Bayern",
+  "position": "MID",
+  "points": 557,
+  "minutes": 192,
+  "appearances": 2,
+  "pointsPerAppearance": 278.5
+}
+```
+
+`appearances` and `pointsPerAppearance` exist in season files only. A
+matchday entry lists the club the player played for that day; a season entry
+lists the current club.
+
+The ongoing matchday is ranked as it stands, with `complete: false` until
+every match is three hours past kickoff. The cutoff is the last fetch, not
+the wall clock, so a re-publish from stale history leaves out matchdays it has
+no points for instead of presenting them as finished and empty.
+
 ## How it works
 
 ```
@@ -217,7 +257,8 @@ available player at a position.
   *today*, so historical matchdays are missing everyone who has since left the
   league. Recent seasons are barely affected; older ones look like a league of
   a few hundred survivors, which is part of why training defaults to the last
-  four seasons (`--seasons`).
+  four seasons (`--seasons`). The rankings inherit this: a player who leaves
+  the league mid-season drops out of earlier matchdays too.
 - **No lineup news.** Surprise rotations are invisible until the market value
   reacts. The accuracy ceiling is below LigaInsider's, and the two-stage split
   is what keeps that error contained in the playing-time model rather than
