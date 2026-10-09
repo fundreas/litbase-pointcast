@@ -132,8 +132,9 @@ def test_index_endpoints_match_the_spec(site, spec):
     index = _load(site / API_VERSION / "index.json")
     documented = set(spec["paths"]) | {f"/{API_VERSION}/openapi.json"}
     assert set(index["endpoints"].values()) <= documented
-    rankings = _load(site / API_VERSION / "rankings" / "index.json")
-    assert set(rankings["endpoints"].values()) <= documented
+    for sub in ("rankings", "lineups"):
+        nested = _load(site / API_VERSION / sub / "index.json")
+        assert set(nested["endpoints"].values()) <= documented, sub
 
 
 def test_operation_ids_are_unique(spec):

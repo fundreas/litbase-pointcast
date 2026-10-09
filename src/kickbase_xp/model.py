@@ -2,7 +2,7 @@
 
 Kickbase points prediction is two problems wearing one coat:
 
-1. will the player be on the pitch at all, and
+1. will the player be on the pitch at all (and in the squad, and in the XI), and
 2. what does he score once he is.
 
 Modelling them jointly forces one tree ensemble to spend its capacity
@@ -52,6 +52,12 @@ STATUS_PLAY_CAP: dict[int, float] = {
     16: 0.02,  # rehab / build-up training
 }
 UNKNOWN_STATUS_CAP = 0.50
+
+# Stage-1 targets, each a binary classifier of its own. Independent binaries
+# rather than one multiclass head: `pStart`/`pPlay` keep their meaning, the
+# status cap stays a plain `min`, and the noisy "came on as sub" class cannot
+# blur the start/bench boundary. Monotonicity is restored after the fact.
+LABEL_COLUMNS = ("in_squad", "played", "started")
 
 # Recency weighting: an observation this old counts half as much.
 RECENCY_HALFLIFE_DAYS = 450.0
@@ -118,6 +124,35 @@ def blend_unconditional_quantile(
     return out
 
 
+class _ConstantClassifier:
+    """Stands in for a classifier whose training labels had one class only.
+
+    Happens on tiny or old data (seasons before 2021/22 carry almost no
+    "not in squad" rows). LightGBM would fit a degenerate model; this says
+    the same thing honestly and has no feature importance to report.
+    """
+
+    def __init__(self, value: float) -> None:
+        self.value = float(value)
+
+    def predict_proba(self, X: pd.DataFrame) -> np.ndarray:
+        p = np.full(len(X), self.value)
+        return np.column_stack([1.0 - p, p])
+
+
+def _fit_classifier(params: dict, X: pd.DataFrame, y: pd.Series, w: np.ndarray | None):
+    labels = y.astype(int)
+    if labels.nunique() < 2:
+        return _ConstantClassifier(labels.iloc[0] if len(labels) else 0.0)
+    m = lgb.LGBMClassifier(**params)
+    m.fit(X, labels, sample_weight=w)
+    return m
+
+
+def _positive_proba(model, X: pd.DataFrame) -> np.ndarray:
+    return model.predict_proba(X)[:, 1]
+
+
 @dataclass
 class TwoStagePrediction:
     frame: pd.DataFrame
@@ -139,6 +174,7 @@ class TwoStageModel:
         self.quantiles = tuple(sorted(quantiles))
         self.use_recency_weights = use_recency_weights
         self.fit_quantiles = fit_quantiles
+        self.squad_model: lgb.LGBMClassifier | None = None
         self.play_model: lgb.LGBMClassifier | None = None
         self.start_model: lgb.LGBMClassifier | None = None
         self.points_model: lgb.LGBMRegressor | None = None
@@ -149,7 +185,7 @@ class TwoStageModel:
     # ------------------------------------------------------------------ fit
 
     def fit(self, train: pd.DataFrame, *, reference: pd.Timestamp | None = None) -> "TwoStageModel":
-        train = train[train["completed"]].dropna(subset=["played"])
+        train = train[train["completed"]].dropna(subset=list(LABEL_COLUMNS))
         if train.empty:
             raise ValueError("no completed rows to train on")
         reference = reference or pd.to_datetime(train["kickoff"], utc=True).max()
@@ -158,11 +194,9 @@ class TwoStageModel:
         w = recency_weights(train["kickoff"], reference) if self.use_recency_weights else None
         self.n_train_rows = len(train)
 
-        self.play_model = lgb.LGBMClassifier(**self.params)
-        self.play_model.fit(X, train["played"].astype(int), sample_weight=w)
-
-        self.start_model = lgb.LGBMClassifier(**self.params)
-        self.start_model.fit(X, train["started"].astype(int), sample_weight=w)
+        self.squad_model = _fit_classifier(self.params, X, train["in_squad"], w)
+        self.play_model = _fit_classifier(self.params, X, train["played"], w)
+        self.start_model = _fit_classifier(self.params, X, train["started"], w)
 
         played = train[train["played"] == 1.0]
         if played.empty:
@@ -197,17 +231,19 @@ class TwoStageModel:
             raise RuntimeError("model is not fitted")
         X = design_matrix(rows)
 
-        p_play_raw = self.play_model.predict_proba(X)[:, 1]
-        p_start_raw = self.start_model.predict_proba(X)[:, 1]
+        p_squad_raw = _positive_proba(self.squad_model, X)
+        p_play_raw = _positive_proba(self.play_model, X)
+        p_start_raw = _positive_proba(self.start_model, X)
 
         if status is None:
             caps = np.ones(len(rows))
         else:
             caps = np.array([status_cap(s) for s in status.to_numpy()], dtype="float64")
-        p_play = np.minimum(p_play_raw, caps)
-        p_start = np.minimum(p_start_raw, caps)
-        # A start implies an appearance.
-        p_start = np.minimum(p_start, p_play)
+        # Capped, then chained: a start implies an appearance, which implies a
+        # squad place. The chain only ever lowers a probability.
+        p_squad = np.minimum(p_squad_raw, caps)
+        p_play = np.minimum(np.minimum(p_play_raw, caps), p_squad)
+        p_start = np.minimum(np.minimum(p_start_raw, caps), p_play)
 
         points_given_play = self.points_model.predict(X)
         xp = p_play * points_given_play
@@ -216,8 +252,11 @@ class TwoStageModel:
             {
                 "player_id": rows["player_id"].to_numpy(),
                 "matchday": rows["matchday"].to_numpy(),
+                "p_squad_raw": p_squad_raw,
+                "p_squad": p_squad,
                 "p_play_raw": p_play_raw,
                 "p_play": p_play,
+                "p_start_raw": p_start_raw,
                 "p_start": p_start,
                 "status_cap": caps,
                 "points_given_play": points_given_play,
@@ -248,11 +287,12 @@ class TwoStageModel:
     def feature_importance(self) -> pd.DataFrame:
         frames = []
         for name, m in (
+            ("p_squad", self.squad_model),
             ("p_play", self.play_model),
             ("p_start", self.start_model),
             ("points", self.points_model),
         ):
-            if m is None:
+            if m is None or not hasattr(m, "booster_"):
                 continue
             frames.append(
                 pd.DataFrame(

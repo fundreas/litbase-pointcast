@@ -52,10 +52,16 @@ def _perf_rows() -> list[tuple]:
             kickoff = _kickoff(md, offset)
             home, away = ("1", "2") if md % 2 else ("2", "1")
             for pid, team, pos in SQUAD:
-                # p4 is a rotation player: only appears on even matchdays.
+                # p4 is a rotation player: only appears on even matchdays, and
+                # on odd ones alternates between an unused bench spot and
+                # missing the squad altogether.
                 appears = not (pid == "p4" and md % 2 == 1)
                 minutes = 90 if appears else 0
                 points = (40 + 12 * pos + 7 * md) if appears else None
+                status = 5 if appears else (1 if md % 4 == 1 else 4)
+                # p8 comes off the bench once, so `played` and `started` differ.
+                if pid == "p8" and md == 5:
+                    minutes, status = 20, 3
                 rows.append(
                     (
                         pid,
@@ -72,7 +78,7 @@ def _perf_rows() -> list[tuple]:
                         2,
                         1,
                         team,
-                        5 if appears else 4,
+                        status,
                         2,
                     )
                 )

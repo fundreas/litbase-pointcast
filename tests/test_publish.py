@@ -141,3 +141,58 @@ def test_feature_matrix_and_predictions_line_up(conn):
     expected = features.prediction_rows(matrix, run.season_id, run.matchday)
     assert len(run.predictions) == len(expected)
     assert set(run.predictions["player_id"]) == set(expected["player_id"])
+
+
+# ------------------------------------------------------------------- lineups
+
+
+def test_lineup_files_exist_for_every_team(published):
+    run, out = published
+    root = out / API_VERSION / "lineups"
+    index = _load(root / "index.json")
+    assert index["matchday"] == run.matchday
+    assert index["tiers"] == ["sure", "likely", "coin_flip", "bench", "out"]
+    assert {t["teamId"] for t in index["teams"]} == {"1", "2"}
+    for team in index["teams"]:
+        assert (out / team["path"].lstrip("/")).exists()
+        current = _load(root / "current" / f"{team['teamId']}.json")
+        assert current == _load(root / str(run.matchday) / f"{team['teamId']}.json")
+
+
+def test_team_lineup_payload(published):
+    run, out = published
+    payload = _load(out / API_VERSION / "lineups" / "current" / "2.json")
+    assert payload["teamName"] == "Beta"
+    assert payload["opponentTeamId"] == "1" and payload["opponentTeamName"] == "Alpha"
+    assert payload["isHome"] is False
+    starters = [e for line in payload["lineup"].values() for e in line]
+    # Beta's four players start every week: a four-man XI with one keeper.
+    assert len(starters) == 4
+    assert len(payload["lineup"]["GK"]) == 1
+    everyone = starters + payload["bench"] + payload["out"]
+    assert payload["summary"]["squadSize"] == len(everyone)
+    counts = {t: sum(e["tier"] == t for e in everyone) for t in payload["summary"]["tiers"]}
+    assert counts == payload["summary"]["tiers"]
+    assert all(e["inLineup"] for e in starters)
+    assert not any(e["inLineup"] for e in payload["bench"] + payload["out"])
+    for e in everyone:
+        assert e["pStart"] <= e["pPlay"] + 1e-9 <= e["pSquad"] + 2e-9
+    ids = {e["playerId"] for e in everyone}
+    for e in everyone:
+        for link in (e["replaces"], e["replacedBy"]):
+            assert link is None or link["playerId"] in ids
+
+
+def test_matchday_entries_carry_all_three_probabilities(published):
+    _, out = published
+    payload = _load(out / API_VERSION / "matchday" / "current.json")
+    for e in payload["players"]:
+        assert {"pSquad", "pSquadRaw", "pStartRaw"} <= set(e)
+        assert e["pStart"] <= e["pStartRaw"] + 1e-9
+
+
+def test_index_advertises_the_lineup_endpoints(published):
+    _, out = published
+    endpoints = _load(out / API_VERSION / "index.json")["endpoints"]
+    assert endpoints["lineups"] == f"/{API_VERSION}/lineups/index.json"
+    assert endpoints["currentTeamLineup"] == f"/{API_VERSION}/lineups/current/{{teamId}}.json"

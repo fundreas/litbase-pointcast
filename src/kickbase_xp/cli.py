@@ -2,6 +2,7 @@
 
     kickbase-xp fetch      # API -> data/history.sqlite
     kickbase-xp predict    # features -> two-stage model -> next matchday
+                           # (--team X: that team's expected lineup)
     kickbase-xp publish    # predictions -> site/v1/*.json
     kickbase-xp run        # all three, i.e. what the nightly Action does
     kickbase-xp validate   # walk-forward MAE report (local, one-time)
@@ -25,14 +26,16 @@ from .config import (
     DEFAULT_DB_PATH,
     DEFAULT_OUT_DIR,
     DEFAULT_SNAPSHOT_DIR,
+    POSITIONS,
     load_credentials,
     load_dotenv,
 )
 from .fetch import run_fetch
+from .lineups import lineups_for_run
 from .publish import publish
 from .rankings import build_rankings
 from .train import run_training
-from .validate import walk_forward
+from .validate import historical_status, walk_forward
 
 
 def _setup_logging(verbose: bool) -> None:
@@ -98,6 +101,8 @@ def _predict(args: argparse.Namespace):
 
 def cmd_predict(args: argparse.Namespace) -> int:
     run = _predict(args)
+    if args.team:
+        return _print_lineup(run, args.team)
     cols = ["last_name", "team_name", "position_label", "status_label", "xP", "p20", "p80",
             "p_start"]
     top = run.predictions[cols].head(args.top)
@@ -107,6 +112,30 @@ def cmd_predict(args: argparse.Namespace) -> int:
     if args.out_csv:
         run.predictions.to_csv(args.out_csv, index=False)
         print(f"\nwrote {args.out_csv}")
+    return 0
+
+
+def _print_lineup(run, team: str) -> int:
+    result = lineups_for_run(run)
+    wanted = team.strip().lower()
+    match = [t for t in result.teams
+             if t.team_id == team or (t.team_name or "").lower() == wanted]
+    if not match:
+        names = ", ".join(f"{t.team_id} {t.team_name}" for t in result.teams)
+        print(f"no team {team!r} on matchday {run.matchday}. Teams: {names}")
+        return 1
+    t = match[0]
+    print(f"\n{t.team_name} -- matchday {run.matchday}, {t.formation} "
+          f"({t.bounds.source}), confidence {t.confidence or 0:.2f}\n")
+    names = run.predictions.set_index(run.predictions["player_id"].astype(str))["last_name"]
+    p = t.players.assign(name=t.players["player_id"].astype(str).map(names),
+                         pos=t.players["position"].map(POSITIONS))
+    p["replaces"] = p["replaces"].map(names)
+    p["replaced_by"] = p["replaced_by"].map(names)
+    cols = ["pos", "depth_rank", "name", "tier", "p_start", "p_play", "p_squad",
+            "replaced_by", "replaces"]
+    with pd.option_context("display.width", 160):
+        print(p[cols].to_string(index=False, float_format=lambda v: f"{v:.2f}"))
     return 0
 
 
@@ -150,12 +179,15 @@ def cmd_validate(args: argparse.Namespace) -> int:
     conn = _connect(args)
     try:
         matrix = features.build_matrix(conn, max_seasons=args.seasons)
+        status = historical_status(conn, matrix) if args.historical_status else None
         result = walk_forward(
             matrix,
             season_id=args.season,
             first_matchday=args.first_matchday,
             last_matchday=args.last_matchday,
             fit_quantiles=args.quantiles,
+            evaluate_lineups=not args.no_lineups,
+            status=status,
         )
     finally:
         conn.close()
@@ -217,6 +249,8 @@ def build_parser() -> argparse.ArgumentParser:
     sp = sub.add_parser("predict", help="train and print the next matchday")
     add_model_args(sp)
     sp.add_argument("--top", type=int, default=25)
+    sp.add_argument("--team", default=None,
+                    help="print this team's expected lineup instead (team id or name)")
     sp.add_argument("--out-csv", default=None)
     sp.set_defaults(func=cmd_predict)
 
@@ -241,6 +275,11 @@ def build_parser() -> argparse.ArgumentParser:
     sp.add_argument("--first-matchday", type=int, default=6)
     sp.add_argument("--last-matchday", type=int, default=None)
     sp.add_argument("--quantiles", action="store_true", help="also fit quantile models (slower)")
+    sp.add_argument("--no-lineups", action="store_true",
+                    help="skip expected-XI assembly and tier calibration")
+    sp.add_argument("--historical-status", action="store_true",
+                    help="cap probabilities with the archived status of the day before kickoff "
+                         "(only exists from 2026-09-10 on)")
     sp.add_argument("--out-csv", default=None)
     sp.set_defaults(func=cmd_validate)
 

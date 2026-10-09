@@ -112,5 +112,36 @@ def test_injury_status_slashes_but_does_not_zero(fitted):
 def test_feature_importance_covers_every_stage(fitted):
     model, _ = fitted
     imp = model.feature_importance()
-    assert set(imp["model"]) == {"p_play", "p_start", "points"}
+    assert set(imp["model"]) == {"p_squad", "p_play", "p_start", "points"}
     assert set(imp["feature"]) == set(features.FEATURE_COLUMNS)
+
+
+def test_probabilities_form_a_chain(fitted):
+    """Starting implies playing implies being in the squad -- raw and capped."""
+    model, target = fitted
+    out = model.predict(target)
+    assert (out["p_play"] <= out["p_squad"] + 1e-12).all()
+    assert (out["p_start"] <= out["p_play"] + 1e-12).all()
+    for col in ("p_squad", "p_play", "p_start"):
+        assert (out[col] <= out[f"{col}_raw"] + 1e-12).all()
+
+
+def test_questionable_status_caps_every_stage(fitted):
+    import pandas as pd
+
+    model, target = fitted
+    out = model.predict(target, status=pd.Series([2] * len(target), index=target.index))
+    for col in ("p_squad", "p_play", "p_start"):
+        assert (out[col] <= STATUS_PLAY_CAP[2] + 1e-12).all()
+
+
+def test_single_class_labels_do_not_break_training(conn):
+    """Old seasons have no "not in squad" rows; the squad stage must cope."""
+    matrix = features.build_matrix(conn, now=NOW, max_seasons=None)
+    train = features.training_rows(matrix).copy()
+    train["in_squad"] = 1.0
+    model = TwoStageModel(params={"n_estimators": 20}, fit_quantiles=False).fit(train)
+    target = features.prediction_rows(matrix, SEASON, SCHEDULED_MATCHDAY)
+    out = model.predict(target)
+    assert (out["p_squad_raw"] == 1.0).all()
+    assert "p_squad" not in set(model.feature_importance()["model"])

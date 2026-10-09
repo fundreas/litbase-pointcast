@@ -24,6 +24,9 @@ Versioned under `/v1/` from the first run, so a later schema change becomes
 | `/v1/matchday/{md}.json` | one specific matchday |
 | `/v1/players/index.json` | compact player list |
 | `/v1/players/{playerId}.json` | one player, including a feature digest |
+| `/v1/lineups/index.json` | teams with an expected lineup for the next matchday |
+| `/v1/lineups/current/{teamId}.json` | one team's expected XI, bench and absentees |
+| `/v1/lineups/{md}/{teamId}.json` | the same, by matchday number |
 
 ```json
 {
@@ -48,6 +51,11 @@ because v1 only ever grows by adding fields and a client validating against it
 should not break when that happens. Its first `servers` entry is the deployed
 Pages URL, which the nightly job takes from `actions/configure-pages`. The
 landing page links the spec as `rel="service-desc"` (RFC 8631).
+
+`pStart` is P(in the starting XI), `pPlay` P(plays at all) and `pSquad`
+P(in the matchday squad), each capped by the player's status; the `…Raw`
+fields are the model's values before that cap. `pStart ≤ pPlay ≤ pSquad`
+always holds.
 
 `p20`/`p80` are **unconditional** — they already fold in the chance of not
 playing at all, so a rotation risk shows up as a floor of `0` rather than as
@@ -96,6 +104,51 @@ The ongoing matchday is ranked as it stands, with `complete: false` until
 every match is three hours past kickoff. The cutoff is the last fetch, not
 the wall clock, so a re-publish from stale history leaves out matchdays it has
 no points for instead of presenting them as finished and empty.
+
+### Lineups
+
+The expected team sheet of every club for the predicted matchday, built from
+the same probabilities as the matchday file.
+
+```json
+{
+  "teamId": "2", "teamName": "Bayern", "opponentTeamId": "10", "isHome": true,
+  "summary": {
+    "formation": "4-4-2", "counts": {"GK": 1, "DEF": 4, "MID": 4, "FWD": 2},
+    "formationSource": "team", "usualFormation": "4-4-2",
+    "formationHistory": ["4-4-2", "4-5-1"], "squadSize": 25, "confidence": 0.81,
+    "tiers": {"sure": 8, "likely": 2, "coin_flip": 3, "bench": 9, "out": 3}
+  },
+  "lineup": {"GK": [...], "DEF": [...], "MID": [...], "FWD": [...]},
+  "bench": [...],
+  "out": [...]
+}
+```
+
+Each player carries `pStart`, `pPlay`, `pSquad` (and their raw values), a
+`tier`, a `depthRank` within his position and two rival links:
+
+| Tier | Meaning |
+|---|---|
+| `sure` | in the expected XI, pStart ≥ 0.85 |
+| `likely` | in the expected XI, pStart ≥ 0.60 |
+| `coin_flip` | in the XI with a lower pStart, or outside it with pStart ≥ 0.35 |
+| `bench` | expected in the squad, not in the XI |
+| `out` | pPlay ≤ 0.05 or pSquad < 0.15 — status or model says he will not be there |
+
+`replaces` on a bench player names the expected starter at his position he
+would most likely replace (the one with the lowest pStart); `replacedBy` on a
+starter names the next man up. Links never cross positions.
+
+**Formations are in Kickbase positions.** Kickbase knows GK, DEF, MID and FWD
+only, so `4-4-2` means four defenders, four midfielders and two forwards as
+Kickbase classifies them, not a tactical system. The usual shape is the most
+common one in the team's last five complete lineups of the *current* season
+(earlier seasons are thinned by survivorship), falling back to the league's,
+then to `4-4-2`. The XI is the shape within the team's observed range that
+maximises summed pStart, with a penalty of 0.10 per player away from the
+usual shape, so it only flexes on clear evidence and does not flap from night
+to night.
 
 ## How it works
 
@@ -148,7 +201,13 @@ what Kickbase exposes.
   so it is stored per row and filtered on everywhere.
 - A finished match with no minutes entry means the player was not involved,
   which is a 0, not a missing value. Distinguishing that from a genuinely
-  scheduled fixture is what `completed` does.
+  scheduled fixture is what `completed` does. A kicked-off fixture the
+  history has not caught up with (`st == 0`, no minutes) is *unknown* and
+  never trained on.
+- The per-match `st` is the real lineup: `5` started (exactly eleven per
+  team), `3` came on, `4` unused bench, `1` not in the squad, `0` not yet
+  played. The `started`/`played`/`in_squad` labels come from it; minutes
+  only back it up, for the 2021/22 season where some subs are filed as `4`.
 
 ### 2. Features — `features.py`
 
@@ -160,8 +219,9 @@ same code path, so training and inference cannot drift apart.
 | Group | Features |
 |---|---|
 | Form | rolling mean/median points (3/5/10), volatility, last result, form over the last N *appearances*, season and career means |
-| Playing time | rolling minutes, play share, start share (≥60 min) over 5/10, season shares, games played, days since last match |
+| Playing time | rolling minutes, play/start/squad share over 5/10, last match's role, start streak, season shares, games played, days since last match |
 | Role | position, matchday |
+| Competition for places | start rank among teammates at the position, the team's usual starters there, rank minus slots, team rotation rate |
 | Market | log market value, 7- and 30-day momentum |
 | Fixture | home/away, opponent points allowed to this position, opponent and own team strength |
 
@@ -181,7 +241,8 @@ imports community knowledge without importing a dependency.
 
 Two stages, because this is two problems:
 
-1. **Playing time** — classifiers for `P(plays)` and `P(starts)`. Most of the
+1. **Playing time** — three classifiers, for `P(in squad)`, `P(plays)` and
+   `P(starts)`, trained on the feed's real lineup labels. Most of the
    predictable signal lives here; a bench player predicted at 180 points is
    worse than useless.
 2. **Points given playing** — a mean regressor plus nine quantile regressors,
@@ -193,9 +254,15 @@ sees everything up to last night.
 
 **Status is a hard override, not a feature.** The fit/injured/suspended flag
 is only ever known for *today*, so training on it would leak. It is applied
-afterwards as a cap on `P(plays)`: suspended → 0, injured → 0.02,
-questionable → 0.5. The model's own belief is kept in `pPlayRaw` for
-debugging.
+afterwards as a cap on all three probabilities: suspended → 0,
+injured → 0.02, questionable → 0.5. The model's own belief is kept in the
+`…Raw` fields for debugging.
+
+### 3b. Lineups — `lineups.py`
+
+Turns per-player probabilities into one team sheet per club: the usual shape,
+the XI that maximises summed pStart within it, tiers, depth ranks and rival
+links. See [Lineups](#lineups) above.
 
 ### 4. Validation — `validate.py`, `baselines.py`
 
@@ -207,6 +274,12 @@ Baselines to beat, from the plan:
 1. `form_x_startshare` — last-5 form × start share
 2. `rolling_mean_5` — the dumbest thing that could work
 3. `position_average`
+
+The walk-forward also scores stage 1 as classifiers (log loss and Brier
+against the rolling share and last-match baselines), calibrates the lineup
+tiers against what actually happened, and counts correct starters out of 11
+against simply repeating the team's last XI. `--historical-status` applies
+the archived status of the day before kickoff, where a snapshot exists.
 
 Plan §6.3 says: if the model cannot beat naive form, ship the heuristic. That
 is not a footnote here — it is wired in. Every nightly run re-checks the model
@@ -260,6 +333,11 @@ modest (−6%); the rank correlation going from 0.51 to 0.62 is the number that
 matters, because nobody picks a squad by absolute points — they pick the best
 available player at a position.
 
+The expected lineups get 9.5 of 11 starters right against 8.8 for "same XI
+as last week", and players tiered `sure` start 89% of the time. On the one
+matchday where LigaInsider's tiers are still on record, the model's top tier
+was as reliable as theirs. Details in [docs/validation.md](docs/validation.md).
+
 ## Known limitations
 
 - **Survivorship bias.** The feed only replays players who are on a squad
@@ -275,8 +353,12 @@ available player at a position.
 - **Status has no history.** Only today's flag is available, so it can only be
   an override. The nightly `status_snapshots` table is accumulating the
   history that would make it a real feature in v2.
-- **`lineup_prob`** is fetched and stored but deliberately unused: it is a
-  LigaInsider-derived tier, and v1 stays free of external predictors.
+- **`lineup_prob`** was a LigaInsider-derived tier, stored but deliberately
+  unused. Kickbase stopped serving it on 2026-09-17; the snapshots up to
+  2026-09-16 keep it as a one-off benchmark for the lineup tiers.
+- **Lineups cannot see news.** A late injury, a new signing without history
+  or a coach resting players for a European week only shows up once the
+  status flag or the market value moves.
 
 ## Later (v2+)
 

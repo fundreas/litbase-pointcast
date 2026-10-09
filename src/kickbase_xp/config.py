@@ -46,8 +46,16 @@ STATUS_LABELS = {
     32: "unknown",
 }
 
-# Per-matchday `st` in the performance feed: 5 == took part.
-PERF_STATUS_PLAYED = 5
+# Per-matchday `st` in the performance feed -- a real lineup label, not a
+# proxy: exactly eleven `5`s per team and matchday. `0` means "not played yet".
+# Seasons before 2021/22 rarely emit `1`/`4` (a player outside the squad simply
+# has no row), and 2021/22 has some subs filed as `4`, so the labels in
+# `features._prepare_base` also consult minutes.
+PERF_STATUS_SCHEDULED = 0
+PERF_STATUS_OUT = 1  # not in the matchday squad
+PERF_STATUS_SUB = 3  # came on from the bench
+PERF_STATUS_BENCH = 4  # in the squad, unused
+PERF_STATUS_STARTED = 5  # in the starting XI
 
 # Kickbase market-value history is expressed in days since the Unix epoch.
 MV_EPOCH_DAYS = "1970-01-01"

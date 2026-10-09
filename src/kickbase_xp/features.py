@@ -19,7 +19,13 @@ from datetime import datetime, timezone
 import numpy as np
 import pandas as pd
 
-from .config import DEFAULT_COMPETITION_NAME
+from .config import (
+    DEFAULT_COMPETITION_NAME,
+    PERF_STATUS_BENCH,
+    PERF_STATUS_SCHEDULED,
+    PERF_STATUS_STARTED,
+    PERF_STATUS_SUB,
+)
 
 log = logging.getLogger(__name__)
 
@@ -59,6 +65,11 @@ FEATURE_COLUMNS = [
     "play_share_10",
     "start_share_5",
     "start_share_10",
+    "squad_share_5",
+    "started_last",
+    "played_last",
+    "squad_last",
+    "start_streak",
     "season_play_share",
     "season_start_share",
     "season_games",
@@ -67,6 +78,11 @@ FEATURE_COLUMNS = [
     # role
     "position",
     "matchday",
+    # competition for places inside the team
+    "start_rank_pos",
+    "team_pos_starters_5",
+    "start_rank_vs_slots",
+    "team_rotation_5",
     # market
     "log_mv",
     "mv_trend_7",
@@ -96,6 +112,8 @@ ID_COLUMNS = [
     "minutes",
     "played",
     "started",
+    "in_squad",
+    "perf_status",
 ]
 
 
@@ -116,7 +134,7 @@ def load_raw(
     perf = pd.read_sql_query(
         """
         SELECT player_id, season_id, matchday, match_id, points, minutes, kickoff,
-               home_team_id, away_team_id, player_team_id
+               home_team_id, away_team_id, player_team_id, perf_status
         FROM performances
         WHERE matchday IS NOT NULL AND kickoff IS NOT NULL
           AND (competition IS NULL OR competition = ?)
@@ -157,22 +175,47 @@ def _prepare_base(perf: pd.DataFrame, players: pd.DataFrame, now: datetime) -> p
     )
 
     df["completed"] = df["kickoff"] < now
-    # A finished match with no minutes entry means the player was not involved.
-    df["minutes"] = df["minutes"].where(df["completed"], other=np.nan)
-    df.loc[df["completed"] & df["minutes"].isna(), "minutes"] = 0.0
-    df["points"] = df["points"].where(df["completed"], other=np.nan)
-    df.loc[df["completed"] & df["points"].isna(), "points"] = 0.0
-
-    df["played"] = np.where(df["completed"], (df["minutes"] > 0).astype(float), np.nan)
-    df["started"] = np.where(
-        df["completed"], (df["minutes"] >= STARTER_MINUTES).astype(float), np.nan
-    )
+    df = _add_labels(df)
     # Points conditional on appearing -- NaN when the player did not appear, so
     # rolling means over it describe form *given playing*.
     df["points_app"] = np.where(df["played"] == 1.0, df["points"], np.nan)
 
     df["season_order"] = pd.to_numeric(df["season_id"], errors="coerce").fillna(-1)
     df = df.sort_values(["player_id", "kickoff", "matchday"]).reset_index(drop=True)
+    return df
+
+
+def _add_labels(df: pd.DataFrame) -> pd.DataFrame:
+    """`started` / `played` / `in_squad`, read off the feed's per-match status.
+
+    The feed's `st` is the real lineup (see `config.PERF_STATUS_*`); minutes
+    only back it up -- `>= 60` was the old starter proxy and misses every
+    starter subbed off early. A kicked-off row still carrying `st == 0` and no
+    minutes is a fixture the history has not caught up with (a stale fetch):
+    its labels and points are *unknown*, not "did not play".
+    """
+    st = df["perf_status"] if "perf_status" in df else pd.Series(np.nan, index=df.index)
+    has_status = st.notna() & (st != PERF_STATUS_SCHEDULED)
+    known = df["completed"] & (has_status | df["minutes"].notna())
+
+    # A known finished match with no minutes entry: the player was not involved.
+    df["minutes"] = df["minutes"].where(df["completed"], other=np.nan)
+    df.loc[known & df["minutes"].isna(), "minutes"] = 0.0
+    df.loc[~known, "minutes"] = np.nan
+    df["points"] = df["points"].where(known, other=np.nan)
+    df.loc[known & df["points"].isna(), "points"] = 0.0
+
+    mins = df["minutes"]
+    on_pitch = mins > 0
+    started = np.where(has_status, st == PERF_STATUS_STARTED, mins >= STARTER_MINUTES)
+    played = np.where(has_status, st.isin([PERF_STATUS_STARTED, PERF_STATUS_SUB]) | on_pitch, on_pitch)
+    in_squad = np.where(
+        has_status,
+        st.isin([PERF_STATUS_STARTED, PERF_STATUS_SUB, PERF_STATUS_BENCH]) | on_pitch,
+        on_pitch,
+    )
+    for name, value in (("started", started), ("played", played), ("in_squad", in_squad)):
+        df[name] = np.where(known, value.astype(float), np.nan)
     return df
 
 
@@ -205,8 +248,21 @@ def _add_player_history(df: pd.DataFrame) -> pd.DataFrame:
     df["play_share_10"] = roll("played", LONG_WINDOW, "mean")
     df["start_share_5"] = roll("started", MEDIUM_WINDOW, "mean")
     df["start_share_10"] = roll("started", LONG_WINDOW, "mean")
+    df["squad_share_5"] = roll("in_squad", MEDIUM_WINDOW, "mean")
     df["pts_last"] = grp["points"].shift(1)
     df["min_last"] = grp["minutes"].shift(1)
+    # Last match's role. P(start | started last) is ~0.8 against ~0.2
+    # otherwise, the single strongest lineup signal in the history.
+    df["started_last"] = grp["started"].shift(1)
+    df["played_last"] = grp["played"].shift(1)
+    df["squad_last"] = grp["in_squad"].shift(1)
+
+    # Consecutive starts strictly before this row. An unknown row breaks the
+    # run, which errs towards "less nailed".
+    prev_start = grp["started"].shift(1)
+    is_start = prev_start == 1.0
+    block = (~is_start).groupby(df["player_id"]).cumsum()
+    df["start_streak"] = is_start.astype(float).groupby([df["player_id"], block]).cumsum()
 
     # Form over the last N appearances (ignores matchdays spent off the pitch).
     for window, name in ((SHORT_WINDOW, "pts_app_mean_3"), (MEDIUM_WINDOW, "pts_app_mean_5")):
@@ -251,6 +307,116 @@ def _add_player_history(df: pd.DataFrame) -> pd.DataFrame:
 
     prev_kickoff = grp["kickoff"].shift(1)
     df["days_since_last_match"] = (df["kickoff"] - prev_kickoff).dt.total_seconds() / 86400.0
+    return df
+
+
+# ------------------------------------------------------------ team context
+
+
+def _asof_team(
+    df: pd.DataFrame, right: pd.DataFrame, by: list[str], cols: list[str]
+) -> pd.DataFrame:
+    """Attach the latest team tally from a *strictly earlier* kickoff.
+
+    `allow_exact_matches=False` is the leak guard: a row never sees the tally
+    of its own matchday, scheduled rows get the latest finished one for free.
+    """
+    left = df[["kickoff", *by]].copy()
+    left["_row"] = np.arange(len(left))
+    left = left.sort_values("kickoff", kind="mergesort")
+    right = right.sort_values("kickoff", kind="mergesort")
+    merged = pd.merge_asof(
+        left,
+        right[["kickoff", *by, *cols]],
+        on="kickoff",
+        by=by,
+        direction="backward",
+        allow_exact_matches=False,
+    )
+    return merged.set_index("_row")[cols].sort_index().set_axis(df.index)
+
+
+def team_games(df: pd.DataFrame) -> pd.DataFrame:
+    """One row per finished (team, season, matchday) with a known lineup.
+
+    Carries the kickoff, the starting XI as a frozenset of player ids and the
+    number of starters per position. `lineups.py` reads formations off this.
+    """
+    done = df[df["completed"] & df["started"].notna()]
+    if done.empty:
+        return pd.DataFrame(
+            columns=["team_id", "season_id", "matchday", "kickoff", "xi", 1, 2, 3, 4]
+        )
+    keys = ["team_id", "season_id", "matchday"]
+    games = done.groupby(keys, as_index=False)["kickoff"].min()
+    starters = done[(done["started"] == 1.0) & done["position"].notna()].copy()
+    starters["position"] = starters["position"].astype(int)
+    xi = starters.groupby(keys)["player_id"].agg(frozenset).rename("xi").reset_index()
+    counts = (
+        starters.groupby(keys + ["position"]).size().unstack("position", fill_value=0)
+        .reindex(columns=[1, 2, 3, 4], fill_value=0)
+        .reset_index()
+    )
+    counts.columns.name = None
+    out = games.merge(xi, on=keys, how="left").merge(counts, on=keys, how="left")
+    out["xi"] = out["xi"].apply(lambda s: s if isinstance(s, frozenset) else frozenset())
+    for pos in (1, 2, 3, 4):
+        out[pos] = out[pos].fillna(0).astype(int)
+    return out.sort_values(["team_id", "kickoff"]).reset_index(drop=True)
+
+
+def _add_team_context(df: pd.DataFrame) -> pd.DataFrame:
+    """Where a player stands against his teammates at the same position.
+
+    Every input here is already a shifted, pre-kickoff quantity or a tally of
+    strictly earlier matchdays, so the cross-player view leaks nothing.
+    """
+    pos_key = df["position"].astype("float").fillna(-1.0)
+    group = [df["season_id"], df["matchday"], df["team_id"], pos_key]
+    df["start_rank_pos"] = (
+        df["start_share_5"].fillna(-1.0).groupby(group).rank(method="min", ascending=False)
+    )
+
+    games = team_games(df)
+    if games.empty:
+        for col in ("team_pos_starters_5", "start_rank_vs_slots", "team_rotation_5"):
+            df[col] = np.nan
+        return df
+
+    # Starters per position, rolled over the team's last five games.
+    long = games.melt(
+        id_vars=["team_id", "kickoff"], value_vars=[1, 2, 3, 4],
+        var_name="position", value_name="n",
+    )
+    long["position"] = long["position"].astype(float)
+    long = long.sort_values(["team_id", "position", "kickoff"])
+    long["team_pos_starters_5"] = long.groupby(["team_id", "position"])["n"].transform(
+        lambda s: s.rolling(MEDIUM_WINDOW, min_periods=1).mean()
+    )
+    df["_pos_key"] = pos_key
+    df["team_pos_starters_5"] = _asof_team(
+        df, long.rename(columns={"position": "_pos_key"}), ["team_id", "_pos_key"],
+        ["team_pos_starters_5"],
+    )["team_pos_starters_5"]
+    df = df.drop(columns=["_pos_key"])
+    df["start_rank_vs_slots"] = df["start_rank_pos"] - df["team_pos_starters_5"]
+
+    # Rotation: share of the XI that is new against the team's previous game.
+    def churn(g: pd.DataFrame) -> pd.Series:
+        prev = g["xi"].shift(1)
+        vals = [
+            (1.0 - len(cur & p) / len(cur)) if isinstance(p, frozenset) and cur else np.nan
+            for cur, p in zip(g["xi"], prev)
+        ]
+        return pd.Series(vals, index=g.index)
+
+    games["churn"] = pd.concat([churn(g) for _, g in games.groupby("team_id", sort=False)])
+    games["team_rotation_5"] = games.groupby("team_id")["churn"].transform(
+        lambda s: s.rolling(MEDIUM_WINDOW, min_periods=1).mean()
+    )
+    df["team_rotation_5"] = _asof_team(df, games, ["team_id"], ["team_rotation_5"])[
+        "team_rotation_5"
+    ]
     return df
 
 
@@ -519,6 +685,7 @@ def build_matrix(
 
     df = _prepare_base(perf, players, now)
     df = _add_player_history(df)
+    df = _add_team_context(df)
     df = _team_position_strength(df)
     df = _add_market_value(df, mv)
 
@@ -547,7 +714,8 @@ def build_matrix(
 
 
 def training_rows(matrix: pd.DataFrame, *, before: pd.Timestamp | None = None) -> pd.DataFrame:
-    rows = matrix[matrix["completed"]]
+    """Kicked-off rows whose outcome is known (see `_add_labels`)."""
+    rows = matrix[matrix["completed"] & matrix["played"].notna()]
     if before is not None:
         rows = rows[rows["kickoff"] < before]
     return rows

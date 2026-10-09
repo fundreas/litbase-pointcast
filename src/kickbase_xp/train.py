@@ -37,6 +37,9 @@ class PredictionRun:
     # them without rebuilding the matrix.
     feature_rows: pd.DataFrame = field(default_factory=pd.DataFrame)
     metadata: dict[str, Any] = field(default_factory=dict)
+    # Finished games with their starting XI (`features.team_games`), the
+    # source `lineups.py` reads each team's recent formations from.
+    team_games: pd.DataFrame = field(default_factory=pd.DataFrame)
 
 
 def current_season_id(matrix: pd.DataFrame) -> str:
@@ -75,6 +78,7 @@ def choose_predictor(
             first_matchday=played_mds[-folds],
             last_matchday=played_mds[-1],
             fit_quantiles=False,
+            evaluate_lineups=False,
         )
     except ValueError as exc:
         log.warning("model selection skipped: %s", exc)
@@ -191,7 +195,7 @@ def run_training(
         "model": {
             "name": MODEL_NAME,
             "library": "lightgbm",
-            "stages": ["p_play", "p_start", "points_given_play", "quantiles"],
+            "stages": ["p_squad", "p_play", "p_start", "points_given_play", "quantiles"],
             "quantiles": list(model.quantiles),
             "train_rows": int(model.n_train_rows),
             "appearance_rows": int(model.n_points_rows),
@@ -210,4 +214,5 @@ def run_training(
         predictions=out,
         feature_rows=target,
         metadata=metadata,
+        team_games=features.team_games(matrix),
     )

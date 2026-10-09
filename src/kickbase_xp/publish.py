@@ -18,6 +18,14 @@ from typing import Any
 import pandas as pd
 
 from .config import POSITIONS
+from .lineups import (
+    FORMATION_WINDOW,
+    TIERS,
+    MatchdayLineups,
+    TeamLineup,
+    formation_label,
+    lineups_for_run,
+)
 from .openapi import SPEC_MEDIA_TYPE, build_spec
 from .rankings import TOP_N, MatchdayStatus, SeasonRankings, ranked
 from .train import PredictionRun
@@ -85,6 +93,9 @@ def player_entry(row: pd.Series, generated_at: str) -> dict[str, Any]:
         # Before the status override, so a consumer can tell "the model thinks
         # he is a starter but he is injured" from "the model benched him".
         "pPlayRaw": _num(row.get("p_play_raw"), 3),
+        "pStartRaw": _num(row.get("p_start_raw"), 3),
+        "pSquad": _num(row.get("p_squad"), 3),
+        "pSquadRaw": _num(row.get("p_squad_raw"), 3),
         "pointsGivenPlay": _num(row.get("points_given_play")),
         "status": row.get("status_label"),
         "marketValue": _int(row.get("market_value")),
@@ -197,6 +208,126 @@ def publish_rankings(rankings: SeasonRankings, version_dir: Path, generated_at: 
     )
 
 
+def _player_ref(player_id: Any, names: dict[str, str]) -> dict[str, str] | None:
+    if player_id is None or (isinstance(player_id, float) and math.isnan(player_id)):
+        return None
+    pid = str(player_id)
+    return {"playerId": pid, "name": names.get(pid, pid)}
+
+
+def lineup_entry(row: pd.Series, names: dict[str, str]) -> dict[str, Any]:
+    """One squad player on a team sheet. Field names are part of the v1 contract."""
+    return {
+        "playerId": str(row["player_id"]),
+        "name": _player_name(row),
+        "position": row.get("position_label") if isinstance(row.get("position_label"), str)
+        else POSITIONS.get(_int(row.get("position"))),
+        "status": row.get("status_label") if isinstance(row.get("status_label"), str) else None,
+        "tier": row["tier"],
+        "depthRank": int(row["depth_rank"]),
+        "inLineup": bool(row["in_lineup"]),
+        "pStart": _num(row.get("p_start"), 3),
+        "pStartRaw": _num(row.get("p_start_raw"), 3),
+        "pPlay": _num(row.get("p_play"), 3),
+        "pPlayRaw": _num(row.get("p_play_raw"), 3),
+        "pSquad": _num(row.get("p_squad"), 3),
+        "pSquadRaw": _num(row.get("p_squad_raw"), 3),
+        "replaces": _player_ref(row.get("replaces"), names),
+        "replacedBy": _player_ref(row.get("replaced_by"), names),
+        "xP": _num(row.get("xP")),
+        "p20": _num(row.get("p20")),
+        "p80": _num(row.get("p80")),
+        "marketValue": _int(row.get("market_value")),
+    }
+
+
+def _team_lineup_payload(
+    team: TeamLineup, run: PredictionRun, generated_at: str
+) -> dict[str, Any]:
+    players = team.players
+    names = {str(r["player_id"]): _player_name(r) for _, r in players.iterrows()}
+    entries = [lineup_entry(r, names) for _, r in players.iterrows()]
+    lineup = {label: [] for label in POSITIONS.values()}
+    bench, out = [], []
+    for entry in entries:
+        if entry["inLineup"]:
+            lineup[entry["position"]].append(entry)
+        elif entry["tier"] == "out":
+            out.append(entry)
+        else:
+            bench.append(entry)
+    confidence = team.confidence
+    return {
+        "apiVersion": API_VERSION,
+        "seasonId": str(run.season_id),
+        "matchday": run.matchday,
+        "generatedAt": generated_at,
+        "predictor": run.metadata.get("predictor"),
+        "teamId": team.team_id,
+        "teamName": team.team_name,
+        "opponentTeamId": team.opponent_team_id,
+        "opponentTeamName": team.opponent_team_name,
+        "isHome": team.is_home,
+        "kickoff": _kickoff(team.kickoff),
+        "summary": {
+            "formation": team.formation,
+            "counts": team.counts,
+            "formationSource": team.bounds.source,
+            "usualFormation": formation_label(team.bounds.mode),
+            "formationHistory": list(team.bounds.history),
+            "squadSize": len(entries),
+            "confidence": _num(confidence, 3),
+            "tiers": team.tier_counts,
+        },
+        "lineup": lineup,
+        "bench": bench,
+        "out": out,
+    }
+
+
+def publish_lineups(
+    lineups: MatchdayLineups, run: PredictionRun, version_dir: Path, generated_at: str
+) -> None:
+    """`/v1/lineups/` -- expected XI, bench and absentees per team."""
+    root = version_dir / "lineups"
+    teams = []
+    for team in lineups.teams:
+        payload = _team_lineup_payload(team, run, generated_at)
+        _write(root / str(run.matchday) / f"{team.team_id}.json", payload)
+        _write(root / "current" / f"{team.team_id}.json", payload)
+        teams.append(
+            {
+                "teamId": team.team_id,
+                "teamName": team.team_name,
+                "opponentTeamId": team.opponent_team_id,
+                "isHome": team.is_home,
+                "kickoff": _kickoff(team.kickoff),
+                "formation": team.formation,
+                "formationSource": team.bounds.source,
+                "confidence": _num(team.confidence, 3),
+                "path": f"/{API_VERSION}/lineups/{run.matchday}/{team.team_id}.json",
+            }
+        )
+    _write(
+        root / "index.json",
+        {
+            "apiVersion": API_VERSION,
+            "seasonId": str(run.season_id),
+            "matchday": run.matchday,
+            "generatedAt": generated_at,
+            "predictor": run.metadata.get("predictor"),
+            "tiers": list(TIERS),
+            "positions": list(POSITIONS.values()),
+            "formationWindow": FORMATION_WINDOW,
+            "teams": teams,
+            "endpoints": {
+                "team": f"/{API_VERSION}/lineups/{{matchday}}/{{teamId}}.json",
+                "currentTeam": f"/{API_VERSION}/lineups/current/{{teamId}}.json",
+            },
+        },
+    )
+
+
 def publish(
     run: PredictionRun,
     out_dir: Path,
@@ -272,6 +403,8 @@ def publish(
     if rankings is not None:
         publish_rankings(rankings, version_dir, generated_at)
 
+    publish_lineups(lineups_for_run(run), run, version_dir, generated_at)
+
     _write(version_dir / "openapi.json", build_spec(API_VERSION, base_url=base_url))
 
     index_payload = {
@@ -294,6 +427,9 @@ def publish(
             "rankings": f"/{API_VERSION}/rankings/index.json",
             "matchdayRanking": f"/{API_VERSION}/rankings/matchday/{{matchday}}.json",
             "seasonRanking": f"/{API_VERSION}/rankings/season/{{matchday}}.json",
+            "lineups": f"/{API_VERSION}/lineups/index.json",
+            "teamLineup": f"/{API_VERSION}/lineups/{{matchday}}/{{teamId}}.json",
+            "currentTeamLineup": f"/{API_VERSION}/lineups/current/{{teamId}}.json",
         },
         "notes": {
             "pointsScale": "Kickbase points, roughly -100..600 per matchday.",
@@ -304,6 +440,12 @@ def publish(
                 "Actual points of the running season, top 100 overall and per position. "
                 "`complete: false` marks a matchday still being played."
             ),
+            "lineups": (
+                "Expected XI per team by Kickbase position, plus bench and absentees. "
+                "Tiers: " + ", ".join(TIERS) + ". `replaces`/`replacedBy` name the "
+                "rival at the same position."
+            ),
+            "pStart": "P(in the starting XI). pPlay: P(plays at all). pSquad: P(in the matchday squad).",
         },
     }
     _write(version_dir / "index.json", index_payload)
@@ -355,12 +497,17 @@ lineup predictors.</p>
 <tr><td><code>/v1/rankings/index.json</code></td><td>matchdays with actual-points rankings</td></tr>
 <tr><td><code>/v1/rankings/matchday/{{md}}.json</code></td><td>top 100 on one matchday, overall and per position</td></tr>
 <tr><td><code>/v1/rankings/season/{{md}}.json</code></td><td>top 100 season totals through matchday md</td></tr>
+<tr><td><code>/v1/lineups/index.json</code></td><td>teams with an expected lineup for the next matchday</td></tr>
+<tr><td><code>/v1/lineups/current/{{teamId}}.json</code></td><td>one team's expected XI, bench and absentees</td></tr>
+<tr><td><code>/v1/lineups/{{md}}/{{teamId}}.json</code></td><td>the same, by matchday number</td></tr>
 </table>
 <h2>Reading the numbers</h2>
 <pre>xP   = P(plays) × E[points | plays]
 p20  = pessimistic case, includes the chance of not playing at all
 p80  = ceiling
-pStart = probability of starting (≥60 minutes)</pre>
+pStart = probability of being in the starting XI
+pPlay  = probability of playing at all; pSquad = of making the matchday squad
+tier   = sure · likely · coin_flip · bench · out (lineup files)</pre>
 <p>Kickbase points run roughly −100…600 per matchday, so an xP of 140 is a solid
 performance, not a typo.</p>
 </body></html>
